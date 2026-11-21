@@ -84,7 +84,6 @@ def is_comment_or_blank(line):
 
 def parse_patch(patch_path):
     """Return changed files, comment-only status, and actual changed lines."""
-
     text = patch_path.read_text(encoding="utf-8", errors="replace")
 
     changed = set()
@@ -97,14 +96,12 @@ def parse_patch(patch_path):
     new_line = None
 
     for line in text.splitlines():
-
         if line.startswith("diff --git "):
             parts = line.split()
             current_file = None
 
             if len(parts) >= 4:
                 path = normalize_path(parts[3])
-
                 if path.startswith("b/"):
                     path = path[2:]
 
@@ -121,7 +118,6 @@ def parse_patch(patch_path):
 
             if path.startswith("b/"):
                 path = path[2:]
-
             if path != "/dev/null":
                 current_file = normalize_path(path)
                 changed.add(current_file)
@@ -140,7 +136,6 @@ def parse_patch(patch_path):
             if match:
                 old_line = int(match.group(1))
                 new_line = int(match.group(3))
-
             continue
 
         if line.startswith(("+++", "---")):
@@ -239,7 +234,6 @@ def select_legacy(changed, by_file, method_to_num, all_tests):
     core_hit = False
 
     for file_path in changed:
-
         if file_path.startswith("tests/fixtures/"):
             rel = file_path[len("tests/fixtures/"):]
             stem = (
@@ -255,7 +249,6 @@ def select_legacy(changed, by_file, method_to_num, all_tests):
             ]:
                 if key in FIXTURE_TO_METHOD:
                     method = FIXTURE_TO_METHOD[key]
-
                     if method in method_to_num:
                         selected.add(method_to_num[method])
 
@@ -360,7 +353,6 @@ def select_by_coverage(
     selected = set()
 
     for file_path in code_changed_files:
-
         if not file_path.startswith("sqlglot/"):
             continue
 
@@ -379,22 +371,32 @@ def select_by_coverage(
 
         candidate_lines = changed_lines.get(file_path, set())
 
+        # First check whether any changed line has direct coverage.
+        direct_hits = set()
+
         for line_number in candidate_lines:
-
             for test_number in line_map.get(str(line_number), []):
-                selected.add(int(test_number))
+                direct_hits.add(int(test_number))
 
+        selected.update(direct_hits)
+
+        # If changed lines have no direct coverage, use all tests
+        # mapped to this source file as a safety fallback.
+        if candidate_lines and not direct_hits:
+            for test_numbers in line_map.values():
+                selected.update(int(n) for n in test_numbers)
+
+        else:
             # Keep a one-line safety margin around changed lines.
-            for nearby in (
-                line_number - 1,
-                line_number + 1,
-            ):
-                if nearby > 0:
-                    for test_number in line_map.get(str(nearby), []):
-                        selected.add(int(test_number))
+            for line_number in candidate_lines:
+                for nearby in (
+                    line_number - 1,
+                    line_number + 1,
+                ):
+                    if nearby > 0:
+                        for test_number in line_map.get(str(nearby), []):
+                            selected.add(int(test_number))
 
-        # Do not select every test in a file just because the changed
-        # lines have no coverage entries. Keep explicit safety rules.
         selected.update(
             select_source_safety_tests(
                 file_path,
@@ -431,29 +433,36 @@ def main():
 
     by_file, method_to_num = build_maps(tests)
     test_by_num = {t["number"]: t for t in tests}
-
     coverage_files, uncovered_tests = load_coverage(tests)
 
     for patch in sorted((DATA / "commits").glob("*.patch")):
-
         changed, only_comments, changed_lines, code_changed_files = (
             parse_patch(patch)
         )
 
-        if only_comments:
+        if not changed:
             print(json.dumps({
                 "commit": patch.stem,
                 "workers": [],
             }))
+            continue
+
+        # For comment-only commits, use the changed files too.
+        # This avoids automatically skipping all tests.
+        selection_files = (
+            changed if only_comments else code_changed_files
+        )
+
+        if only_comments:
             print(
-                f"{patch.stem}: only comments",
+                f"{patch.stem}: comment-only change; "
+                "using file-based safety selection",
                 file=sys.stderr,
             )
-            continue
 
         non_source = {
             file_path
-            for file_path in code_changed_files
+            for file_path in selection_files
             if not file_path.startswith("sqlglot/")
         }
 
@@ -466,7 +475,7 @@ def main():
 
         selected.update(
             select_by_coverage(
-                code_changed_files,
+                selection_files,
                 changed_lines,
                 coverage_files,
                 by_file,
