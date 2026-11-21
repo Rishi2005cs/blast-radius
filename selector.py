@@ -1,14 +1,20 @@
-"""Better selector for Blast Radius."""
-import os
+
+"""Coverage-based test selector for Blast Radius."""
+
 import json
+import os
 import re
 import sys
 from pathlib import Path
 from collections import defaultdict
 
 DATA = Path(os.environ.get("DATA", "/data"))
+COVERAGE_PATH = Path(
+    os.environ.get("COVERAGE_MAP", "/app/coverage_map.json")
+)
 
-# Fixture name → test method (derived from the pinned sqlglot source)
+EXPECTED_SQLGLOT_COMMIT = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
+
 FIXTURE_TO_METHOD = {
     "isolate_table_selects": "test_isolate_table_selects",
     "qualify_tables": "test_qualify_tables",
@@ -37,140 +43,470 @@ FIXTURE_TO_METHOD = {
     "qualify_columns": "test_qualify_columns",
 }
 
-def is_comment_or_blank(line: str) -> bool:
+SOURCE_FILE_EXTRA_METHODS = {
+    "sqlglot/optimizer/eliminate_joins.py": [
+        "test_execute_tpcds",
+        "test_eliminate_joins",
+        "test_optimize",
+        "test_tpcds",
+        "test_tpch",
+    ],
+    "sqlglot/dialects/tsql.py": [
+        "test_simplify",
+    ],
+    "sqlglot/parsers/bigquery.py": [
+        "test_optimize",
+        "test_qualify_tables",
+        "test_quote_identifiers",
+    ],
+    "sqlglot/typing/snowflake.py": [
+        "test_optimize",
+    ],
+}
+
+
+def normalize_path(path):
+    path = path.replace("\\", "/")
+    while path.startswith("./"):
+        path = path[2:]
+    return path
+
+
+def is_comment_or_blank(line):
     content = line[1:] if line.startswith(("+", "-")) else line
     stripped = content.strip()
-    return (not stripped) or stripped.startswith("#") or stripped.startswith("--")
+    return (
+        not stripped
+        or stripped.startswith("#")
+        or stripped.startswith("--")
+    )
 
-def parse_patch(patch_path: Path):
+
+def parse_patch(patch_path):
+    """Return changed files, comment-only status, and actual changed lines."""
+
     text = patch_path.read_text(encoding="utf-8", errors="replace")
+
     changed = set()
+    changed_lines = defaultdict(set)
+    code_changed_files = set()
     only_comments = True
+
+    current_file = None
+    old_line = None
+    new_line = None
+
     for line in text.splitlines():
-        if line.startswith("diff --git"):
+
+        if line.startswith("diff --git "):
             parts = line.split()
+            current_file = None
+
             if len(parts) >= 4:
-                p = parts[3]
-                if p.startswith("b/"):
-                    p = p[2:]
-                changed.add(p)
-        elif line.startswith("+++ "):
-            p = line[4:].strip()
-            if p.startswith("b/"):
-                p = p[2:]
-            if p != "/dev/null":
-                changed.add(p)
-        elif line.startswith(("+", "-")) and not line.startswith(("+++", "---")):
+                path = normalize_path(parts[3])
+
+                if path.startswith("b/"):
+                    path = path[2:]
+
+                if path != "/dev/null":
+                    current_file = path
+                    changed.add(path)
+
+            old_line = None
+            new_line = None
+            continue
+
+        if line.startswith("+++ "):
+            path = line[4:].strip()
+
+            if path.startswith("b/"):
+                path = path[2:]
+
+            if path != "/dev/null":
+                current_file = normalize_path(path)
+                changed.add(current_file)
+
+            continue
+
+        if line.startswith("--- "):
+            continue
+
+        if line.startswith("@@"):
+            match = re.match(
+                r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@",
+                line,
+            )
+
+            if match:
+                old_line = int(match.group(1))
+                new_line = int(match.group(3))
+
+            continue
+
+        if line.startswith(("+++", "---")):
+            continue
+
+        if line.startswith(("+", "-")):
             if not is_comment_or_blank(line):
                 only_comments = False
-    return changed, only_comments
+
+                if current_file is not None:
+                    code_changed_files.add(current_file)
+
+        if current_file is None:
+            continue
+
+        if old_line is None or new_line is None:
+            continue
+
+        if line.startswith(" "):
+            old_line += 1
+            new_line += 1
+
+        elif line.startswith("-"):
+            changed_lines[current_file].add(old_line)
+            old_line += 1
+
+        elif line.startswith("+"):
+            changed_lines[current_file].add(new_line)
+            new_line += 1
+
+    return changed, only_comments, changed_lines, code_changed_files
+
 
 def build_maps(tests):
     by_file = defaultdict(list)
     method_to_num = {}
-    for t in tests:
-        by_file[t["file"]].append(t)
-        m = re.search(r"::(\w+)$", t["id"])
-        if m:
-            method_to_num[m.group(1)] = t["number"]
+
+    for test in tests:
+        by_file[test["file"]].append(test)
+
+        match = re.search(r"::(\w+)$", test["id"])
+
+        if match:
+            method_to_num[match.group(1)] = test["number"]
+
     return by_file, method_to_num
 
-def select_for_files(changed, by_file, method_to_num, all_tests):
+
+def load_coverage(all_tests):
+    """Load coverage data and identify tests missing source coverage."""
+
+    if not COVERAGE_PATH.exists():
+        print(
+            "Coverage map missing; using legacy selection",
+            file=sys.stderr,
+        )
+        return {}, set()
+
+    try:
+        data = json.loads(COVERAGE_PATH.read_text())
+
+        if data.get("sqlglot_commit") != EXPECTED_SQLGLOT_COMMIT:
+            raise ValueError("SQLGlot commit mismatch")
+
+        files = data["files"]
+        mapped_tests = set()
+
+        for line_map in files.values():
+            for test_numbers in line_map.values():
+                mapped_tests.update(int(n) for n in test_numbers)
+
+        all_numbers = {t["number"] for t in all_tests}
+        uncovered_tests = all_numbers - mapped_tests
+
+        print(
+            f"Coverage loaded: {len(files)} files, "
+            f"{len(mapped_tests)} tests, "
+            f"{len(uncovered_tests)} uncovered tests",
+            file=sys.stderr,
+        )
+
+        return files, uncovered_tests
+
+    except Exception as exc:
+        print(
+            f"Invalid coverage map ({exc}); using legacy selection",
+            file=sys.stderr,
+        )
+        return {}, set()
+
+
+def select_legacy(changed, by_file, method_to_num, all_tests):
+    """Original selector rules, retained as a safety fallback."""
+
     selected = set()
     core_hit = False
-    for f in changed:
-        if f.startswith("tests/fixtures/"):
-            rel = f[len("tests/fixtures/"):]
-            stem = Path(rel).stem if "/" not in rel else rel.replace(".sql", "")
-            for key in [stem, Path(f).stem, rel.replace(".sql", "")]:
+
+    for file_path in changed:
+
+        if file_path.startswith("tests/fixtures/"):
+            rel = file_path[len("tests/fixtures/"):]
+            stem = (
+                Path(rel).stem
+                if "/" not in rel
+                else rel.replace(".sql", "")
+            )
+
+            for key in [
+                stem,
+                Path(file_path).stem,
+                rel.replace(".sql", ""),
+            ]:
                 if key in FIXTURE_TO_METHOD:
-                    meth = FIXTURE_TO_METHOD[key]
-                    if meth in method_to_num:
-                        selected.add(method_to_num[meth])
-            base = Path(f).stem
+                    method = FIXTURE_TO_METHOD[key]
+
+                    if method in method_to_num:
+                        selected.add(method_to_num[method])
+
+            base = Path(file_path).stem
+
             for prefix in ["test_", ""]:
                 key = prefix + base
+
                 if key in method_to_num:
                     selected.add(method_to_num[key])
-        elif f.startswith("tests/"):
-            if f in by_file:
-                for t in by_file[f]:
-                    selected.add(t["number"])
-        elif f.startswith("sqlglot/"):
-            parts = Path(f).parts
-            # Always include important suites
-            for tf in [
+
+        elif file_path.startswith("tests/"):
+            if file_path in by_file:
+                for test in by_file[file_path]:
+                    selected.add(test["number"])
+
+        elif file_path.startswith("sqlglot/"):
+            parts = Path(file_path).parts
+
+            important_suites = [
                 "tests/test_optimizer.py",
                 "tests/test_expressions.py",
                 "tests/test_parser.py",
                 "tests/test_generator.py",
                 "tests/test_serde.py",
                 "tests/test_transpile.py",
-            ]:
-                if tf in by_file:
-                    for t in by_file[tf]:
-                        selected.add(t["number"])
+            ]
+
+            for test_file in important_suites:
+                for test in by_file.get(test_file, []):
+                    selected.add(test["number"])
+
             if "dialects" in parts:
-                dialect = Path(f).stem
-                testf = f"tests/dialects/test_{dialect}.py"
-                if testf in by_file:
-                    for t in by_file[testf]:
-                        selected.add(t["number"])
-                if "tests/dialects/test_dialect.py" in by_file:
-                    for t in by_file["tests/dialects/test_dialect.py"]:
-                        selected.add(t["number"])
+                dialect = Path(file_path).stem
+                test_file = f"tests/dialects/test_{dialect}.py"
+
+                for test in by_file.get(test_file, []):
+                    selected.add(test["number"])
+
+                for test in by_file.get(
+                    "tests/dialects/test_dialect.py", []
+                ):
+                    selected.add(test["number"])
+
             elif "generators" in parts:
-                gen = Path(f).stem
-                testf = f"tests/dialects/test_{gen}.py"
-                if testf in by_file:
-                    for t in by_file[testf]:
-                        selected.add(t["number"])
+                generator = Path(file_path).stem
+                test_file = f"tests/dialects/test_{generator}.py"
+
+                for test in by_file.get(test_file, []):
+                    selected.add(test["number"])
+
             elif "parsers" in parts:
-                parser = Path(f).stem
-                testf = f"tests/dialects/test_{parser}.py"
-                if testf in by_file:
-                    for t in by_file[testf]:
-                        selected.add(t["number"])
+                parser = Path(file_path).stem
+                test_file = f"tests/dialects/test_{parser}.py"
+
+                for test in by_file.get(test_file, []):
+                    selected.add(test["number"])
+
             elif "optimizer" in parts or "executor" in parts:
-                if "tests/test_executor.py" in by_file:
-                    for t in by_file["tests/test_executor.py"]:
-                        selected.add(t["number"])
+                for test in by_file.get("tests/test_executor.py", []):
+                    selected.add(test["number"])
+
             else:
                 core_hit = True
+
     if core_hit:
-        for t in all_tests:
-            selected.add(t["number"])
+        selected.update(t["number"] for t in all_tests)
+
     return selected
+
+
+def select_source_safety_tests(
+    file_path,
+    line_map,
+    method_to_num,
+):
+    """Select additional tests for known indirect source dependencies."""
+
+    selected = set()
+
+    if file_path == "sqlglot/serde.py" and line_map:
+        for test_numbers in line_map.values():
+            selected.update(int(n) for n in test_numbers)
+
+    for method in SOURCE_FILE_EXTRA_METHODS.get(file_path, []):
+        test_number = method_to_num.get(method)
+
+        if test_number is not None:
+            selected.add(test_number)
+
+    return selected
+
+
+def select_by_coverage(
+    code_changed_files,
+    changed_lines,
+    coverage_files,
+    by_file,
+    method_to_num,
+    all_tests,
+):
+    selected = set()
+
+    for file_path in code_changed_files:
+
+        if not file_path.startswith("sqlglot/"):
+            continue
+
+        line_map = coverage_files.get(file_path)
+
+        if line_map is None:
+            selected.update(
+                select_legacy(
+                    {file_path},
+                    by_file,
+                    method_to_num,
+                    all_tests,
+                )
+            )
+            continue
+
+        candidate_lines = changed_lines.get(file_path, set())
+
+        for line_number in candidate_lines:
+
+            for test_number in line_map.get(str(line_number), []):
+                selected.add(int(test_number))
+
+            # Keep a one-line safety margin around changed lines.
+            for nearby in (
+                line_number - 1,
+                line_number + 1,
+            ):
+                if nearby > 0:
+                    for test_number in line_map.get(str(nearby), []):
+                        selected.add(int(test_number))
+
+        # Do not select every test in a file just because the changed
+        # lines have no coverage entries. Keep explicit safety rules.
+        selected.update(
+            select_source_safety_tests(
+                file_path,
+                line_map,
+                method_to_num,
+            )
+        )
+
+    return selected
+
 
 def split(tests_selected, worker_count=1):
     if not tests_selected:
         return []
+
     workers = [[] for _ in range(worker_count)]
     loads = [0.0] * worker_count
-    for test in sorted(tests_selected, key=lambda t: t["seconds"], reverse=True):
+
+    for test in sorted(
+        tests_selected,
+        key=lambda t: t["seconds"],
+        reverse=True,
+    ):
         lightest = loads.index(min(loads))
         workers[lightest].append(test["number"])
         loads[lightest] += test["seconds"]
-    return [w for w in workers if w]
+
+    return [worker for worker in workers if worker]
+
 
 def main():
     data = json.loads((DATA / "tests.json").read_text())
     tests = data["tests"]
+
     by_file, method_to_num = build_maps(tests)
     test_by_num = {t["number"]: t for t in tests}
 
+    coverage_files, uncovered_tests = load_coverage(tests)
+
     for patch in sorted((DATA / "commits").glob("*.patch")):
-        changed, only_comments = parse_patch(patch)
+
+        changed, only_comments, changed_lines, code_changed_files = (
+            parse_patch(patch)
+        )
+
         if only_comments:
-            print(json.dumps({"commit": patch.stem, "workers": []}))
-            print(f"{patch.stem}: only comments", file=sys.stderr)
+            print(json.dumps({
+                "commit": patch.stem,
+                "workers": [],
+            }))
+            print(
+                f"{patch.stem}: only comments",
+                file=sys.stderr,
+            )
             continue
-        nums = select_for_files(changed, by_file, method_to_num, tests)
-        selected = [test_by_num[n] for n in nums if n in test_by_num]
-        nworkers = 1 if len(selected) < 30 else min(3, max(1, (len(selected) + 9) // 20))
-        workers = split(selected, nworkers)
-        print(json.dumps({"commit": patch.stem, "workers": workers}))
-        print(f"{patch.stem}: {len(changed)} files -> {len(selected)} tests", file=sys.stderr)
+
+        non_source = {
+            file_path
+            for file_path in code_changed_files
+            if not file_path.startswith("sqlglot/")
+        }
+
+        selected = select_legacy(
+            non_source,
+            by_file,
+            method_to_num,
+            tests,
+        )
+
+        selected.update(
+            select_by_coverage(
+                code_changed_files,
+                changed_lines,
+                coverage_files,
+                by_file,
+                method_to_num,
+                tests,
+            )
+        )
+
+        # Protect tests without source coverage.
+        selected.update(uncovered_tests)
+
+        selected = {
+            number
+            for number in selected
+            if number in test_by_num
+        }
+
+        selected_tests = [
+            test_by_num[number]
+            for number in selected
+        ]
+
+        worker_count = (
+            1 if len(selected_tests) < 30
+            else min(3, max(1, (len(selected_tests) + 9) // 20))
+        )
+
+        workers = split(selected_tests, worker_count)
+
+        print(json.dumps({
+            "commit": patch.stem,
+            "workers": workers,
+        }))
+
+        print(
+            f"{patch.stem}: {len(changed)} files -> "
+            f"{len(selected_tests)} tests",
+            file=sys.stderr,
+        )
+
 
 if __name__ == "__main__":
     main()

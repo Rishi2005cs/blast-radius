@@ -1,0 +1,15 @@
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# SQLGlot checkout and temporary coverage data
+.work/
+.coverage*
+*.tmp
+*.log
+
+# Keep coverage_map.json tracked
+output.jsonl
